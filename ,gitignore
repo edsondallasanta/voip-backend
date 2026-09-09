@@ -1,0 +1,5 @@
+node_modules/
+.env
+serviceAccountKey.json
+voip-9e7ad-firebase-adminsdk-*.json
+.DS_Store
