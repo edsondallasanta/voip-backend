@@ -3,4 +3,3 @@ node_modules/
 serviceAccountKey.json
 voip-9e7ad-firebase-adminsdk-*.json
 .DS_Store
-echo voip-9e7ad-firebase-adminsdk-fbsvc-00d732e16d.json >> .gitignore
