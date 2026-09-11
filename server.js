@@ -15,13 +15,9 @@ try {
 // ============ INICIALIZAÇÃO DO FIREBASE ============
 try {
     if (admin) {
-        // 🔥 Tenta carregar as credenciais de variáveis de ambiente (Render)
-        // ou do arquivo local (desenvolvimento)
         let serviceAccount;
         
-        // Verifica se estamos no Render (variáveis de ambiente)
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
-            console.log('🔑 Usando credenciais do ambiente (Render)...');
             serviceAccount = {
                 project_id: process.env.FIREBASE_PROJECT_ID,
                 private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
@@ -35,42 +31,131 @@ try {
                 universe_domain: "googleapis.com"
             };
         } else {
-            // Tenta carregar do arquivo local (desenvolvimento)
-            try {
-                console.log('📁 Tentando carregar arquivo de credenciais local...');
-                serviceAccount = require('./voip-9e7ad-firebase-adminsdk-fbsvc-00d732e16d.json');
-                console.log('✅ Arquivo de credenciais local carregado!');
-            } catch (fileError) {
-                console.log('⚠️ Arquivo de credenciais local não encontrado.');
-                throw new Error('Credenciais não encontradas');
-            }
+            serviceAccount = require('./voip-9e7ad-firebase-adminsdk-fbsvc-00d732e16d.json');
         }
 
-        if (admin.credential && typeof admin.credential.cert === 'function') {
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount),
-            });
-            firebaseInitialized = true;
-            console.log('✅ Firebase Admin inicializado com sucesso!');
-            console.log(`   Projeto: ${serviceAccount.project_id}`);
-        }
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+        });
+        firebaseInitialized = true;
+        console.log('✅ Firebase Admin inicializado!');
+        console.log(`   Projeto: ${serviceAccount.project_id}`);
     }
 } catch (e) {
     console.log('❌ Erro ao inicializar Firebase:', e.message);
-    console.log('⚠️  O servidor rodará em modo simulação');
 }
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ============ BANCO DE DADOS EM MEMÓRIA ============
-const users = {};
+// ============ FIRESTORE (PERSISTÊNCIA) ============
+const db = firebaseInitialized ? admin.firestore() : null;
+const USERS_COLLECTION = 'voip_users';
+
+// Fallback em memória (caso Firestore não esteja disponível)
+const usersMemory = {};
+
+// ============ FUNÇÕES AUXILIARES ============
+
+async function saveUser(userId, fcmToken) {
+    const userData = {
+        fcmToken,
+        lastSeen: new Date().toISOString()
+    };
+    
+    if (db) {
+        try {
+            await db.collection(USERS_COLLECTION).doc(userId).set(userData);
+            console.log(`💾 Usuário ${userId} salvo no Firestore`);
+            return true;
+        } catch (e) {
+            console.log('❌ Erro ao salvar no Firestore:', e.message);
+            usersMemory[userId] = userData;
+            return false;
+        }
+    } else {
+        usersMemory[userId] = userData;
+        return false;
+    }
+}
+
+async function getUser(userId) {
+    if (db) {
+        try {
+            const doc = await db.collection(USERS_COLLECTION).doc(userId).get();
+            if (doc.exists) {
+                return doc.data();
+            }
+            return null;
+        } catch (e) {
+            console.log('❌ Erro ao buscar no Firestore:', e.message);
+            return usersMemory[userId] || null;
+        }
+    } else {
+        return usersMemory[userId] || null;
+    }
+}
+
+async function listUsers() {
+    if (db) {
+        try {
+            const snapshot = await db.collection(USERS_COLLECTION).get();
+            const users = [];
+            snapshot.forEach(doc => {
+                users.push({
+                    id: doc.id,
+                    fcmToken: doc.data().fcmToken ? doc.data().fcmToken.substring(0, 20) + '...' : null,
+                    lastSeen: doc.data().lastSeen
+                });
+            });
+            return users;
+        } catch (e) {
+            console.log('❌ Erro ao listar do Firestore:', e.message);
+            return Object.keys(usersMemory).map(id => ({
+                id: id,
+                fcmToken: usersMemory[id].fcmToken ? usersMemory[id].fcmToken.substring(0, 20) + '...' : null,
+                lastSeen: usersMemory[id].lastSeen
+            }));
+        }
+    } else {
+        return Object.keys(usersMemory).map(id => ({
+            id: id,
+            fcmToken: usersMemory[id].fcmToken ? usersMemory[id].fcmToken.substring(0, 20) + '...' : null,
+            lastSeen: usersMemory[id].lastSeen
+        }));
+    }
+}
+
+async function deleteUser(userId) {
+    if (db) {
+        try {
+            await db.collection(USERS_COLLECTION).doc(userId).delete();
+            return true;
+        } catch (e) {
+            console.log('❌ Erro ao deletar no Firestore:', e.message);
+        }
+    }
+    delete usersMemory[userId];
+    return true;
+}
 
 // ============ ENDPOINTS ============
 
 // 1. Status do servidor
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
+    let userCount = 0;
+    if (db) {
+        try {
+            const snapshot = await db.collection(USERS_COLLECTION).get();
+            userCount = snapshot.size;
+        } catch (e) {
+            userCount = Object.keys(usersMemory).length;
+        }
+    } else {
+        userCount = Object.keys(usersMemory).length;
+    }
+
     res.json({
         status: 'online',
         firebase: {
@@ -78,13 +163,16 @@ app.get('/status', (req, res) => {
             hasAdmin: !!admin,
             sdkVersion: admin ? admin.SDK_VERSION : null,
         },
-        users: Object.keys(users).length,
+        firestore: {
+            enabled: !!db,
+        },
+        users: userCount,
         timestamp: new Date().toISOString()
     });
 });
 
 // 2. Registrar token FCM
-app.post('/register-token', (req, res) => {
+app.post('/register-token', async (req, res) => {
     const { userId, fcmToken } = req.body;
     
     if (!userId || !fcmToken) {
@@ -93,19 +181,16 @@ app.post('/register-token', (req, res) => {
         });
     }
     
-    users[userId] = { 
-        fcmToken, 
-        lastSeen: new Date() 
-    };
+    await saveUser(userId, fcmToken);
     
     console.log(`✅ Usuário ${userId} registrado com token: ${fcmToken.substring(0, 20)}...`);
     res.json({ success: true, userId });
 });
 
 // 3. Buscar token de um usuário
-app.get('/users/:userId/token', (req, res) => {
+app.get('/users/:userId/token', async (req, res) => {
     const { userId } = req.params;
-    const user = users[userId];
+    const user = await getUser(userId);
     
     if (user) {
         res.json({ fcmToken: user.fcmToken });
@@ -115,15 +200,11 @@ app.get('/users/:userId/token', (req, res) => {
 });
 
 // 4. Listar todos os usuários
-app.get('/users', (req, res) => {
-    const userList = Object.keys(users).map(id => ({
-        id: id,
-        fcmToken: users[id].fcmToken ? users[id].fcmToken.substring(0, 20) + '...' : null,
-        lastSeen: users[id].lastSeen
-    }));
+app.get('/users', async (req, res) => {
+    const users = await listUsers();
     res.json({
-        total: userList.length,
-        users: userList
+        total: users.length,
+        users: users
     });
 });
 
@@ -250,15 +331,11 @@ app.post('/test-fcm', async (req, res) => {
 });
 
 // 7. Remover usuário
-app.delete('/users/:userId', (req, res) => {
+app.delete('/users/:userId', async (req, res) => {
     const { userId } = req.params;
-    if (users[userId]) {
-        delete users[userId];
-        console.log(`🗑️  Usuário ${userId} removido`);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Usuário não encontrado' });
-    }
+    await deleteUser(userId);
+    console.log(`🗑️  Usuário ${userId} removido`);
+    res.json({ success: true });
 });
 
 // ============ INICIAR SERVIDOR ============
@@ -272,8 +349,8 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('🚀 ==========================================');
     console.log('');
     console.log(`   🔥 Firebase: ${firebaseInitialized ? '✅ CONECTADO' : '❌ DESCONECTADO'}`);
+    console.log(`   💾 Firestore: ${db ? '✅ ATIVO (persistente)' : '⚠️  MEMÓRIA (volátil)'}`);
     console.log(`   📦 Versão Admin: ${admin ? admin.SDK_VERSION : 'N/A'}`);
-    console.log(`   👥 Usuários cadastrados: ${Object.keys(users).length}`);
     console.log('');
     console.log('📋 ENDPOINTS:');
     console.log(`   GET  /status                    - Status`);
